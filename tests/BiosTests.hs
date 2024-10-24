@@ -23,7 +23,9 @@ import System.FilePath ((</>))
 import System.Exit (ExitCode(ExitSuccess, ExitFailure))
 import Control.Monad.Extra (unlessM)
 import qualified HIE.Bios.Ghc.Gap as Gap
+import HIE.Bios.Types
 import Control.Monad.IO.Class
+import Data.Maybe (isJust)
 
 argDynamic :: [String]
 argDynamic = ["-dynamic" | Gap.hostIsDynamic]
@@ -56,7 +58,18 @@ main = do
         , testGroupWithDependency cabalDep (cabalTestCases extraGhcDep)
         , ignoreOnUnsupportedGhc $ testGroupWithDependency stackDep stackTestCases
         ]
+      -- cradle extra is exra information stored in cradle for batch load
+      , testGroup "cradle extra" cradleExtraTests
       ]
+
+mergeCradleTests :: [TestTree]
+mergeCradleTests =
+  [ testCaseSteps "cabal extra" $ runTestEnv "./multi-cabal" $ do
+      initCradle "app/Main.hs"
+      crd <- askCradle
+      let x = cabalOpts (cradleOptsProg crd) "app/Main.hs" (LoadWithContext [])
+      return ()
+  ]
 
 symbolicLinkTests :: [TestTree]
 symbolicLinkTests =
@@ -161,6 +174,9 @@ cabalTestCases extraGhcDep =
           , "cabal.project"
           , "cabal.project.local"
           ]
+
+    -- [ testCaseSteps "Appropriate ghc and libdir" $ runTestEnvLocal "./cabal-with-ghc" $ do
+    --     initCradle "src/MyLib.hs"
   , testCaseSteps "multi-cabal" $ runTestEnv "./multi-cabal" $ do
       {- tests if both components can be loaded -}
       testDirectoryM isCabalCradle "app/Main.hs"
@@ -311,6 +327,72 @@ findCradleTests =
       runTestEnv dir $ do
         findCradleForModuleM fpTarget result
 
+
+cradleExtraTests :: [TestTree]
+cradleExtraTests = [
+  testCaseSteps "cabal-with-project-extra" $ runTestEnv "./cabal-with-project" $ do
+      {- tests if cabal has extra -}
+      testDirectoryMIO (hasCabalExtra "src/MyLib.hs") "src/MyLib.hs"
+  , testCaseSteps "multi-cabal-extra" $ runTestEnv "./multi-cabal" $ do
+      {- tests if cabal has extra -}
+      testDirectoryMIO (hasCabalExtra "app/Main.hs") "app/Main.hs"
+      testDirectoryMIO (hasCabalExtra "src/Lib.hs") "src/Lib.hs"
+  , testCaseSteps "multi-cabal-extra" $ runTestEnv "./multi-cabal" $ do
+      {- tests if cabal has extra -}
+      initCradle "app/Main.hs"
+      cr1 <-askCradle
+      initCradle "app/Lib.hs"
+      cr2 <-askCradle
+      -- let x = mergeActionExtra cr1 cr2
+      inCradleRootDir $ do
+        result <- liftIO $ runCradlesInBatch testLogger (LoadWithContext []) [(cr1, "app/Main.hs"), (cr2, "app/Lib.hs")]
+        liftIO $ cradleRootDir cr1 @?= cradleRootDir cr2
+        liftIO $ 1 @?= length result
+
+  , testCaseSteps "multi-cabal-with-project-extra" $ runTestEnv "./multi-cabal-with-project" $ do
+      {- tests if cabal has extra -}
+      initCradle "appA/src/Lib.hs"
+      cr1 <-askCradle
+      initCradle "appB/src/Lib.hs"
+      cr2 <-askCradle
+      -- let x = mergeActionExtra cr1 cr2
+      inCradleRootDir $ do
+        result <- liftIO $ runCradlesInBatch testLogger (LoadWithContext []) [(cr1, "appA/src/Lib.hs"), (cr2, "appB/src/Lib.hs")]
+        liftIO $ cradleRootDir cr1 @?= cradleRootDir cr2
+        liftIO $ 1 @?= length result
+
+  , testCaseSteps "nested-cabal-extra" $ runTestEnv "./nested-cabal" $ do
+      {- tests if cabal has extra -}
+      initCradle "nested-cabal/sub-comp/Lib.hs"
+      cr1 <-askCradle
+      initCradle "nested-cabal/MyLib.hs"
+      cr2 <-askCradle
+      -- let x = mergeActionExtra cr1 cr2
+      inCradleRootDir $ do
+        result <- liftIO $ runCradlesInBatch testLogger (LoadWithContext []) [(cr1, "nested-cabal/sub-comp/Lib.hs"), (cr2, "nested-cabal/MyLib.hs")]
+        liftIO $ cradleRootDir cr1 @?= cradleRootDir cr2
+        liftIO $ 1 @?= length result
+        liftIO $ assertBool "All cradles should be successful" $ allSuccess $ map snd result
+
+  , testCaseSteps "multi-direct-extra don't merge" $ runTestEnv "./multi-direct" $ do
+      initCradle "A.hs"
+      cr1 <-askCradle
+      initCradle "B.hs"
+      cr2 <-askCradle
+      inCradleRootDir $ do
+        result <- liftIO $ runCradlesInBatch testLogger (LoadWithContext []) [(cr1, "A.hs"), (cr2, "B.hs")]
+        liftIO $ cradleRootDir cr1 @?= cradleRootDir cr2
+        liftIO $ 2 @?= length result
+        liftIO $ assertBool "All cradles should be successful" $ allSuccess $ map snd result
+  ]
+  where
+    hasCabalExtra :: FilePath -> Cradle a -> IO Bool
+    hasCabalExtra f cradle = isJust <$> cabalOpts (cradleOptsProg cradle) f (LoadWithContext [])
+    allSuccess :: [CradleLoadResult ComponentOptions] -> Bool
+    allSuccess = all isCradleSuccess
+    isCradleSuccess :: CradleLoadResult a -> Bool
+    isCradleSuccess (CradleSuccess _) = True
+    isCradleSuccess _ = False
 -- ------------------------------------------------------------------
 -- Unit-test Helper functions
 -- ------------------------------------------------------------------

@@ -5,6 +5,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE RecursiveDo #-}
 {-# LANGUAGE RecordWildCards #-}
+
 module HIE.Bios.Cradle (
       findCradle
     , loadCradle
@@ -23,6 +24,7 @@ module HIE.Bios.Cradle (
     , readProcessWithOutputs
     , readProcessWithCwd
     , makeCradleResult
+    , runCradlesInBatch
     -- | Cradle project configuration types
     , CradleProjectConfig(..)
   ) where
@@ -47,7 +49,7 @@ import qualified Data.Conduit.Combinators as C
 import qualified Data.Conduit as C
 import qualified Data.Conduit.Text as C
 import qualified Data.HashMap.Strict as Map
-import Data.Maybe (fromMaybe, maybeToList)
+import Data.Maybe (fromMaybe, maybeToList, isJust, catMaybes, mapMaybe)
 import Data.List
 import Data.List.Extra (trimEnd)
 import Data.Ord (Down(..))
@@ -119,42 +121,6 @@ getCradle l buildCustomCradle (cc, wdir) = do
     cs = resolveCradleTree wdir cc
 
 
--- | The actual type of action we will be using to process a file
-data ConcreteCradle a
-  = ConcreteCabal CabalType
-  | ConcreteStack StackType
-  | ConcreteBios Callable (Maybe Callable) (Maybe FilePath)
-  | ConcreteDirect [String]
-  | ConcreteNone
-  | ConcreteOther a
-  deriving Show
-
--- | ConcreteCradle augmented with information on which file the
--- cradle applies
-data ResolvedCradle a
- = ResolvedCradle
- { prefix :: FilePath -- ^ the prefix to match files
- , cradleDeps :: [FilePath] -- ^ accumulated dependencies
- , concreteCradle :: ConcreteCradle a
- } deriving Show
-
--- | The final cradle config that specifies the cradle for
--- each prefix we know how to handle
-data ResolvedCradles a
- = ResolvedCradles
- { cradleRoot :: FilePath
- , resolvedCradles :: [ResolvedCradle a] -- ^ In order of decreasing specificity
- , cradleProgramVersions :: ProgramVersions
- }
-
-data ProgramVersions =
-  ProgramVersions { cabalVersion  :: CachedIO (Maybe Version)
-                  , stackVersion  :: CachedIO (Maybe Version)
-                  , ghcVersion    :: CachedIO (Maybe Version)
-                  }
-
-newtype CachedIO a = CachedIO (IORef (Either (IO a) a))
-
 makeCachedIO :: IO a -> IO (CachedIO a)
 makeCachedIO act = CachedIO <$> newIORef (Left act)
 
@@ -212,6 +178,35 @@ addActionDeps deps =
       (\(ComponentOptions os' dir ds) -> CradleSuccess (ComponentOptions os' dir (ds `union` deps)))
 
 
+-- | runCradlesInBatch
+-- run multiple cradles in batch,
+-- comparing with run cradles on by one,
+-- with help of load multiple code unit feature of cabal,
+-- it will merge cabal actions in the same project,
+-- minimizing the number of calls to cabal.
+runCradlesInBatch :: LogAction IO (WithSeverity Log) -> LoadStyle -> [(Cradle a, FilePath)] -> IO [([FilePath], (CradleLoadResult ComponentOptions))]
+runCradlesInBatch logger l cfs = do
+        cabalOptsFs <- mapM (\(c, f) -> do extra <- cabalOpts (cradleOptsProg c) f l; return (extra, c, f)) cfs
+        let (calbalCradles, otherCradles) = partition (\(x, _, _) -> isJust x) cabalOptsFs
+            actionExtras = map (foldl1 mergeActionExtra) $ groupBy sameProject (mapMaybe (\(x, _, _) -> x) calbalCradles)
+        resultsB <- mapM (\(_, cr, f) -> sequence ([f], runCradle (cradleOptsProg cr) f l)) otherCradles
+        resultsA <- mapM (\x -> sequence (fst <$> actionModule x, runCradleResultT $ actionExtraCabalAction logger [] x)) actionExtras
+        return $ resultsA ++ resultsB
+  where
+        sameProject :: ActionExtra -> ActionExtra -> Bool
+        sameProject a b = actionWorkingDir a == actionWorkingDir b
+                        || actionProjectConfig a == actionProjectConfig b
+
+
+mergeActionExtra :: ActionExtra -> ActionExtra -> ActionExtra
+mergeActionExtra a b = ActionExtra
+  { actionResolvedCradles = actionResolvedCradles a
+  , actionWorkingDir = actionWorkingDir a
+  , actionModule = actionModule a <> actionModule b
+  , actionProjectConfig = actionProjectConfig a
+  , actionDeps = actionDeps a ++ actionDeps b
+  }
+
 resolvedCradlesToCradle :: Show a => LogAction IO (WithSeverity Log) -> (b -> CradleAction a) -> FilePath -> [ResolvedCradle b] -> IO (Cradle a)
 resolvedCradlesToCradle logger buildCustomCradle root cs = mdo
   let run_ghc_cmd args =
@@ -245,9 +240,17 @@ resolvedCradlesToCradle logger buildCustomCradle root cs = mdo
               addActionDeps (cradleDeps rc) <$> runCradle act fp prev
             Nothing -> return $ CradleFail $ CradleError [] ExitSuccess (err_msg fp)
       , runGhcCmd = run_ghc_cmd
+      -- todo fp should be absolute
+      , cabalOpts = \fp config -> do
+            absfp <- makeAbsolute fp
+            case selectCradle (prefix . fst) absfp cradleActions of
+              Just (rc, act) -> fmap (appendActionDeps (cradleDeps rc)) <$> cabalOpts act fp config
+              Nothing -> error $ "no prefix was found in fp:" ++ absfp ++ "; total of cradleActions:" ++ show (concatMap (prefix . fst) cradleActions) ++ "; root:" ++ root
       }
     }
   where
+    appendActionDeps :: [FilePath] -> ActionExtra -> ActionExtra
+    appendActionDeps deps a = a { actionDeps = actionDeps a ++ deps }
     multiActionName
       | all (\c -> isStackCradleConfig c || isNoneCradleConfig c) cs
       = Types.Stack
@@ -426,6 +429,7 @@ defaultCradle l cur_dir =
         , runCradle = \_ _ ->
             return (CradleSuccess (ComponentOptions argDynamic cur_dir []))
         , runGhcCmd = runGhcCmdOnPath l cur_dir
+        , cabalOpts = const . const $ return Nothing
         }
     }
 
@@ -438,6 +442,7 @@ noneCradle =
       { actionName = Types.None
       , runCradle = \_ _ -> return CradleNone
       , runGhcCmd = \_ -> return CradleNone
+      , cabalOpts = const . const $ return Nothing
       }
 
 ---------------------------------------------------------------
@@ -469,6 +474,7 @@ directCradle l wdir args
           logCradleHasNoSupportForLoadWithContext l loadStyle "direct"
           return (CradleSuccess (ComponentOptions (args ++ argDynamic) wdir []))
       , runGhcCmd = runGhcCmdOnPath l wdir
+      , cabalOpts = const . const $ return Nothing
       }
 
 
@@ -483,6 +489,7 @@ biosCradle l wdir biosCall biosDepsCall mbGhc
       { actionName = Types.Bios
       , runCradle = biosAction wdir biosCall biosDepsCall l
       , runGhcCmd = \args -> readProcessWithCwd l wdir (fromMaybe "ghc" mbGhc) args ""
+      , cabalOpts = const . const $ return Nothing
       }
 
 biosWorkDir :: FilePath -> MaybeT IO FilePath
@@ -554,6 +561,7 @@ cabalCradle l cs wdir mc projectFile
         -- Need to pass -v0 otherwise we get "resolving dependencies..."
         cabalProc <- cabalProcess l projectFile wdir "v2-exec" $ ["ghc", "-v0", "--"] ++ args
         readProcessWithCwd' l cabalProc ""
+    , cabalOpts = \file -> const (return $ Just (ActionExtra (void cs) wdir [(file, mc)] projectFile []))
     }
 
 
@@ -788,6 +796,75 @@ cabalGhcDirs l cabalProject workDir = do
   where
     projectFileArgs = projectFileProcessArgs cabalProject
 
+actionExtraCabalAction
+  :: LogAction IO (WithSeverity Log)
+  -> [FilePath]
+  -> ActionExtra
+  -> CradleLoadResultT IO ComponentOptions
+actionExtraCabalAction l oldfps ActionExtra{..}  =
+ let (ResolvedCradles root cs _vs) = actionResolvedCradles
+     amcs = actionModule
+     projectFile = actionProjectConfig
+     workDir = actionWorkingDir
+     -- Need to make relative on Windows, due to a Cabal bug with how it
+     -- parses file targets with a C: drive in it
+     fixTargetPath x
+       | isWindows && hasDrive x = makeRelative workDir x
+       | otherwise = x
+ in do
+  -- determine which load style is supported by this cabal cradle.
+  let cabalArgs = concat
+          [ [ "--keep-temp-files"
+            , "--enable-multi-repl"
+            ]
+          , [ fromMaybe (fixTargetPath fp) mc | (fp, mc) <- amcs ]
+          , [fromMaybe (fixTargetPath old_fp) old_mc
+            | old_fp <- oldfps
+            -- Lookup the component for the old file
+            , Just (ResolvedCradle{concreteCradle = ConcreteCabal ct}) <- [selectCradle prefix old_fp cs]
+            -- Only include this file if the old component is in the same project
+            , (projectConfigFromMaybe root (cabalProjectFile ct)) == projectFile
+            , let old_mc = cabalComponent ct
+            ]
+          ]
+
+  liftIO $ l <& LogComputedCradleLoadStyle "cabal" (LoadWithContext oldfps) `WithSeverity` Info
+
+  let
+    cabalCommand = "v2-repl"
+
+  cabalProc <- cabalProcess l projectFile workDir cabalCommand cabalArgs `modCradleError` \err -> do
+      deps <- cabalCradleDependencies projectFile workDir workDir
+      pure $ err { cradleErrorDependencies = cradleErrorDependencies err ++ deps }
+
+  (ex, output, stde, [(_, maybeArgs)]) <- liftIO $ readProcessWithOutputs [hie_bios_output] l workDir cabalProc
+  let args = fromMaybe [] maybeArgs
+
+  let errorDetails =
+        ["Failed command: " <> prettyCmdSpec (cmdspec cabalProc)
+        , unlines output
+        , unlines stde
+        , unlines $ args
+        , "Process Environment:"]
+        <> prettyProcessEnv cabalProc
+
+  when (ex /= ExitSuccess) $ do
+    deps <- liftIO $ cabalCradleDependencies projectFile workDir workDir
+    let cmd = show (["cabal", cabalCommand] <> cabalArgs)
+    let errorMsg = "Failed to run " <> cmd <> " in directory \"" <> workDir <> "\". Consult the logs for full command and error."
+    throwCE (CradleError deps ex ([errorMsg] <> errorDetails))
+
+  case processCabalWrapperArgs args of
+    Nothing -> do
+      -- Provide some dependencies an IDE can look for to trigger a reload.
+      -- Best effort. Assume the working directory is the
+      -- root of the component, so we are right in trivial cases at least.
+      deps <- liftIO $ cabalCradleDependencies projectFile workDir workDir
+      throwCE (CradleError deps ex $ ["Failed to parse result of calling cabal" ] <> errorDetails)
+    Just (componentDir, final_args) -> do
+      deps <- liftIO $ cabalCradleDependencies projectFile workDir componentDir
+      CradleLoadResultT $ pure $ makeCradleResult (ex, stde, componentDir, final_args) deps
+
 cabalAction
   :: ResolvedCradles a
   -> FilePath
@@ -922,14 +999,6 @@ cabalWorkDir wdir =
 
 ------------------------------------------------------------------------
 
--- | Explicit data-type for project configuration location.
--- It is basically a 'Maybe' type, but helps to document the API
--- and helps to avoid incorrect usage.
-data CradleProjectConfig
-  = NoExplicitConfig
-  | ExplicitConfig FilePath
-  deriving Eq
-
 -- | Create an explicit project configuration. Expects a working directory
 -- followed by an optional name of the project configuration.
 projectConfigFromMaybe :: FilePath -> Maybe FilePath -> CradleProjectConfig
@@ -960,6 +1029,7 @@ stackCradle l wdir mc syaml =
         readProcessWithCwd_ l wdir "stack"
           (stackYamlProcessArgs syaml <> ["exec", "ghc", "--"] <> args)
           ""
+    , cabalOpts = const . const $ return Nothing
     }
 
 -- | @'stackCradleDependencies' rootDir componentDir@.

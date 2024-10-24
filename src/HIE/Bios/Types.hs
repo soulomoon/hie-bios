@@ -3,7 +3,9 @@
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE DeriveTraversable #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE ExistentialQuantification #-}
 module HIE.Bios.Types where
+
 
 import           System.Exit
 import qualified Colog.Core as L
@@ -15,8 +17,11 @@ import qualified Control.Monad.Fail as Fail
 #endif
 import           Data.Maybe (fromMaybe)
 import qualified Data.Text as T
+import           Data.Version
 import           Prettyprinter
 import           System.Process.Extra (CreateProcess (env, cmdspec), CmdSpec (..))
+import           HIE.Bios.Config
+import Data.IORef
 
 ----------------------------------------------------------------
 -- Environment variables used by hie-bios.
@@ -155,11 +160,32 @@ data LoadStyle
   -- session in GHC.
   deriving (Show, Eq, Ord)
 
+-- | Explicit data-type for project configuration location.
+-- It is basically a 'Maybe' type, but helps to document the API
+-- and helps to avoid incorrect usage.
+data CradleProjectConfig
+  = NoExplicitConfig
+  | ExplicitConfig FilePath
+  deriving Eq
+
+-- give name for them
+-- data ActionExtra = forall b. ActionExtra (ResolvedCradles b) FilePath (Maybe String) CradleProjectConfig [FilePath]
+data ActionExtra = ActionExtra {
+  actionResolvedCradles :: ResolvedCradles ()
+  , actionWorkingDir :: FilePath
+  , actionModule:: [(String, Maybe String)]
+  , actionProjectConfig :: CradleProjectConfig
+  , actionDeps :: [FilePath]
+}
+
+
 data CradleAction a = CradleAction {
                         actionName    :: ActionName a
                       -- ^ Name of the action.
                       , runCradle     :: FilePath -> LoadStyle -> IO (CradleLoadResult ComponentOptions)
                       -- ^ Options to compile the given file with.
+                      , cabalOpts :: !(FilePath -> LoadStyle -> IO (Maybe ActionExtra))
+                      -- ^ Options extra for loading in batch
                       , runGhcCmd     :: [String] -> IO (CradleLoadResult String)
                       -- ^ Executes the @ghc@ binary that is usually used to
                       -- build the cradle. E.g. for a cabal cradle this should be
@@ -271,6 +297,24 @@ data CradleError = CradleError
 
 instance Exception CradleError where
 ----------------------------------------------------------------
+--
+-- | Option information for GHC
+data ComponentOptionsMulti = ComponentOptionsMulti {
+    multiComponentOptions  :: [String]  -- ^ Command line options.
+  , multiComponentRoot :: FilePath
+  -- ^ Root directory of the component. All 'componentOptions' are either
+  -- absolute, or relative to this directory.
+  , multiComponentDependencies :: [(FilePath, [FilePath])]
+  -- ^ Dependencies of a cradle that might change the cradle.
+  -- Contains both files specified in hie.yaml as well as
+  -- specified by the build-tool if there is any.
+  -- FilePaths are expected to be relative to the `cradleRootDir`
+  -- to which this CradleAction belongs to.
+  -- Files returned by this action might not actually exist.
+  -- This is useful, because, sometimes, adding specific files
+  -- changes the options that a Cradle may return, thus, needs reload
+  -- as soon as these files are created.
+  } deriving (Eq, Ord, Show)
 
 -- | Option information for GHC
 data ComponentOptions = ComponentOptions {
@@ -310,3 +354,42 @@ prettyProcessEnv p =
                , hie_bios_deps
                ]
   ]
+
+-- ------------------------------------------------
+
+-- | The actual type of action we will be using to process a file
+data ConcreteCradle a
+  = ConcreteCabal CabalType
+  | ConcreteStack StackType
+  | ConcreteBios Callable (Maybe Callable) (Maybe FilePath)
+  | ConcreteDirect [String]
+  | ConcreteNone
+  | ConcreteOther a
+  deriving (Show, Functor)
+
+-- | ConcreteCradle augmented with information on which file the
+-- cradle applies
+data ResolvedCradle a
+ = ResolvedCradle
+ { prefix :: FilePath -- ^ the prefix to match files
+ , cradleDeps :: [FilePath] -- ^ accumulated dependencies
+ , concreteCradle :: ConcreteCradle a
+ } deriving (Show, Functor)
+
+-- | The final cradle config that specifies the cradle for
+-- each prefix we know how to handle
+data ResolvedCradles a
+ = ResolvedCradles
+ { cradleRoot :: FilePath
+ , resolvedCradles :: [ResolvedCradle a] -- ^ In order of decreasing specificity
+ , cradleProgramVersions :: ProgramVersions
+ } deriving Functor
+
+
+newtype CachedIO a = CachedIO (IORef (Either (IO a) a))
+
+data ProgramVersions =
+  ProgramVersions { cabalVersion  :: CachedIO (Maybe Version)
+                  , stackVersion  :: CachedIO (Maybe Version)
+                  , ghcVersion    :: CachedIO (Maybe Version)
+                  }

@@ -46,6 +46,7 @@ module Utils (
   loadRuntimeGhcVersion,
   inCradleRootDir,
   loadFileGhc,
+  testLogger,
 
   -- * Assertion helpers
   assertCradle,
@@ -63,6 +64,7 @@ module Utils (
 
   -- * High-level test helpers
   testDirectoryM,
+  testDirectoryMIO,
   testImplicitDirectoryM,
   findCradleForModuleM,
 ) where
@@ -327,6 +329,12 @@ assertCradle cradlePred = do
   crd <- askCradle
   liftIO $ cradlePred crd @? "Must be the correct kind of cradle, got " ++ show (actionName $ cradleOptsProg crd)
 
+assertCradleIO :: (Cradle Void -> IO Bool) -> TestM ()
+assertCradleIO cradlePred = do
+  crd <- askCradle
+  r <- liftIO $ cradlePred crd
+  liftIO $ r @? "Must be the correct kind of cradle, got " ++ show (actionName $ cradleOptsProg crd)
+
 assertLibDirVersion :: TestM ()
 assertLibDirVersion = assertLibDirVersionIs VERSION_ghc
 
@@ -392,6 +400,17 @@ assertCradleLoadError = \case
 -- ---------------------------------------------------------------------------
 -- High-level, re-usable assertions
 -- ---------------------------------------------------------------------------
+--
+testDirectoryMIO :: (Cradle Void -> IO Bool) -> FilePath -> TestM ()
+testDirectoryMIO cradlePred file = do
+  initCradle file
+  inCradleRootDir $ do
+    assertCradleIO cradlePred
+    loadRuntimeGhcLibDir
+    assertLibDirVersion
+    loadRuntimeGhcVersion
+    assertGhcVersion
+    loadFileGhc file
 
 testDirectoryM :: (Cradle Void -> Bool) -> FilePath -> TestM ()
 testDirectoryM cradlePred file = do
