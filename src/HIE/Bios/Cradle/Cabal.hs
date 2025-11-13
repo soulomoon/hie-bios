@@ -26,7 +26,7 @@ import qualified Data.Aeson as Aeson
 import qualified Data.Aeson.Types as Aeson
 import qualified Data.ByteString as BS
 import Data.Conduit.Process
-import Data.Maybe (fromMaybe)
+import Data.Maybe (fromMaybe, catMaybes)
 import Data.List
 import Data.List.Extra (trimEnd, nubOrd)
 import qualified Data.Text as T
@@ -256,18 +256,24 @@ runCabalGhcCmd cs wdir l projectFile args = runCradleResultT $ do
 processCabalLoadStyle :: MonadIO m => LogAction IO (WithSeverity Log) -> ResolvedCradles a -> CradleProjectConfig -> [Char] -> Maybe FilePath -> [Char] -> LoadStyle -> m ([FilePath], [FilePath], [FilePath])
 processCabalLoadStyle l cradles projectFile workDir mc fp loadStyle = do
   let fpModule = fromMaybe (fixTargetPath fp) mc
-  let (cabalArgs, loadingFiles, extraDeps) = case loadStyle of
-        LoadFile -> ([fpModule], [fp], [])
-        LoadWithContext fps ->
-          let -- Get the target file's dependencies from its cradle
-              targetFileDeps = case selectCradle prefix fp (resolvedCradles cradles) of
-                Just (ResolvedCradle {cradleDeps = deps}) -> deps
-                Nothing -> []
-              allModulesFpsDeps = ((fpModule, fp, targetFileDeps) : moduleFilesFromSameProject fps)
+  (cabalArgs, loadingFiles, extraDeps) <- case loadStyle of
+        LoadFile -> pure ([fpModule], [fp], [])
+        LoadWithContext fps -> do
+          -- Get the target file's dependencies from its cradle (both YAML and dynamic)
+          targetFileDeps <- case selectCradle prefix fp (resolvedCradles cradles) of
+            Just (ResolvedCradle {cradleDeps = yamlDeps, prefix = targetPrefix}) -> do
+              dynDeps <- liftIO $ cabalCradleDependencies projectFile (cradleRoot cradles) targetPrefix
+              pure (yamlDeps ++ dynDeps)
+            Nothing -> pure []
+          
+          -- Get dependencies for all context files
+          contextFilesDeps <- moduleFilesFromSameProject fps
+          
+          let allModulesFpsDeps = ((fpModule, fp, targetFileDeps) : contextFilesDeps)
               allModules = nubOrd $ fst3 <$> allModulesFpsDeps
               allFiles = nubOrd $ snd3 <$> allModulesFpsDeps
               allFpsDeps = nubOrd $ concatMap thd3 allModulesFpsDeps
-           in (["--enable-multi-repl"] ++ allModules, allFiles, allFpsDeps)
+          pure (["--enable-multi-repl"] ++ allModules, allFiles, allFpsDeps)
 
   liftIO $ l <& LogComputedCradleLoadStyle "cabal" loadStyle `WithSeverity` Info
   liftIO $ l <& LogCabalLoad fp mc (prefix <$> resolvedCradles cradles) loadingFiles `WithSeverity` Debug
@@ -279,15 +285,20 @@ processCabalLoadStyle l cradles projectFile workDir mc fp loadStyle = do
     fixTargetPath x
       | isWindows && hasDrive x = makeRelative workDir x
       | otherwise = x
-    moduleFilesFromSameProject fps =
-      [ (fromMaybe (fixTargetPath file) old_mc, file, deps)
-      | file <- fps,
-        -- Lookup the component for the old file
-        Just (ResolvedCradle {concreteCradle = ConcreteCabal ct, cradleDeps = deps}) <- [selectCradle prefix file (resolvedCradles cradles)],
-        -- Only include this file if the old component is in the same project
-        (projectConfigFromMaybe (cradleRoot cradles) (cabalProjectFile ct)) == projectFile,
-        let old_mc = cabalComponent ct
-      ]
+    
+    moduleFilesFromSameProject :: MonadIO m => [FilePath] -> m [(FilePath, FilePath, [FilePath])]
+    moduleFilesFromSameProject fps = do
+      forM fps $ \file -> do
+        case selectCradle prefix file (resolvedCradles cradles) of
+          Just (ResolvedCradle {concreteCradle = ConcreteCabal ct, cradleDeps = yamlDeps, prefix = filePrefix})
+            | projectConfigFromMaybe (cradleRoot cradles) (cabalProjectFile ct) == projectFile -> do
+                -- Compute dynamic dependencies for this context file's component
+                dynDeps <- liftIO $ cabalCradleDependencies projectFile (cradleRoot cradles) filePrefix
+                let old_mc = cabalComponent ct
+                    combinedDeps = yamlDeps ++ dynDeps
+                pure $ Just (fromMaybe (fixTargetPath file) old_mc, file, combinedDeps)
+          _ -> pure Nothing
+      >>= pure . catMaybes
 
 cabalLoadFilesWithRepl :: LogAction IO (WithSeverity Log) -> CradleProjectConfig -> FilePath -> [String] -> CradleLoadResultT IO CreateProcess
 cabalLoadFilesWithRepl l projectFile workDir args = do
