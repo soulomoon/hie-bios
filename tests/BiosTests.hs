@@ -15,7 +15,7 @@ import qualified Test.Tasty.Options as Tasty
 import qualified Test.Tasty.Ingredients as Tasty
 import HIE.Bios
 import HIE.Bios.Cradle
-import Control.Monad ( forM_ )
+import Control.Monad ( forM_, when )
 import Data.List ( sort, isPrefixOf )
 import Data.Typeable
 import System.Exit (ExitCode(ExitSuccess, ExitFailure))
@@ -197,6 +197,19 @@ cabalTestCases extraGhcDep =
       {- tests if both components can be loaded -}
       testDirectoryM isCabalCradle "app/Main.hs"
       testDirectoryM isCabalCradle "src/Lib.hs"
+  , biosTestCase "multi-cabal-batch-load-dependencies" $ runTestEnv "./multi-cabal" $ do
+      {- tests that dependencies are correctly accumulated for all files in batch load mode -}
+      initCradle "app/Main.hs"
+      assertCradle isCabalCradle
+      multiSupported <- isCabalMultipleCompSupported'
+      when multiSupported $ do
+        loadComponentOptionsMultiStyle "app/Main.hs" ["src/Lib.hs"]
+        assertComponentOptions $ \opts -> do
+          componentDependencies opts `shouldMatchList`
+            [ "multi-cabal.cabal"
+            , "cabal.project"
+            , "cabal.project.local"
+            ]
   , {- issue https://github.com/mpickering/hie-bios/issues/200 -}
     biosTestCase "monorepo-cabal" $ runTestEnv "./monorepo-cabal" $ do
       testDirectoryM isCabalCradle "A/Main.hs"
