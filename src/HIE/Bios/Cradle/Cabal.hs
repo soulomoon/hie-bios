@@ -259,7 +259,11 @@ processCabalLoadStyle l cradles projectFile workDir mc fp loadStyle = do
   let (cabalArgs, loadingFiles, extraDeps) = case loadStyle of
         LoadFile -> ([fpModule], [fp], [])
         LoadWithContext fps ->
-          let allModulesFpsDeps = ((fpModule, fp, []) : moduleFilesFromSameProject fps)
+          let -- Get the target file's dependencies from its cradle
+              targetFileDeps = case selectCradle prefix fp (resolvedCradles cradles) of
+                Just (ResolvedCradle {cradleDeps = deps}) -> deps
+                Nothing -> []
+              allModulesFpsDeps = ((fpModule, fp, targetFileDeps) : moduleFilesFromSameProject fps)
               allModules = nubOrd $ fst3 <$> allModulesFpsDeps
               allFiles = nubOrd $ snd3 <$> allModulesFpsDeps
               allFpsDeps = nubOrd $ concatMap thd3 allModulesFpsDeps
