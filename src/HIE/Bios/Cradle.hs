@@ -433,7 +433,7 @@ biosAction rc wdir bios bios_deps l fp loadStyle = do
         -- delimited by newlines.
         -- Execute the bios action and add dependencies of the cradle.
         -- Removes all duplicates.
-  return $ makeCradleResult (ex, std, wdir, fromMaybe [] res) deps [fp]
+  return $ makeCradleResult (ex, std, wdir, fromMaybe [] res) deps fps
 
 withCallableToProcess :: Callable -> [String] -> ContT a IO CreateProcess
 withCallableToProcess (Command shellCommand) files = ContT $ \action -> do
